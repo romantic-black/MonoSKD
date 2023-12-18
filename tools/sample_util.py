@@ -2,6 +2,7 @@ import numpy as np
 import open3d as o3d
 import pathlib
 import re
+import random
 import cv2
 import pickle
 from lib.datasets.kitti_utils import Calibration
@@ -24,7 +25,7 @@ def merge_labels(labels, samples, calib_, image_shape):
         v_max = round(min(np.max(uv[:, 1]), image_shape[0]))
 
         canvas[v_min: v_max, u_min: u_max] = i
-        label.area = (v_max - v_min) * (u_max - u_min)
+        label.area = (v_max - v_min) * (u_max - u_min) + 1e-6
     for i, label in enumerate(labels):
         area = np.sum(canvas == i)
         label.area = 1 - area / label.area
@@ -32,15 +33,17 @@ def merge_labels(labels, samples, calib_, image_shape):
         label.level = label.get_obj_level()
     return labels
 
+
 def area2occlusion(area):
     if area < 0.1:
         return 0
     elif area < 0.4:
         return 1
-    elif area < 0.7:
+    elif area < 0.8:
         return 2
     else:
         return 3
+
 
 def to3d(image, depth, calib, bbox2d=None):
     assert image.shape[:2] == depth.shape
@@ -70,7 +73,13 @@ def to2d(cord, rgb, calib):
 
 
 class SampleDatabase:
-    def __init__(self, database_path, idx_list=None):
+    def __init__(self,
+                 database_path,
+                 idx_list=None,
+                 sample_num=30,
+                 x_range=(-15., 15.),
+                 z_range=(25., 65.),
+                 random_flip=0.5):
         self.database_path = pathlib.Path(database_path)
         assert self.database_path.exists()
         self.image_path = self.database_path / "image"
@@ -78,17 +87,21 @@ class SampleDatabase:
         # self.mask_path = self.database_path / "mask"
         with open(self.database_path / "kitti_car_database.pkl", "rb") as f:
             database = pickle.load(f)
+        with open(self.database_path / "sample_image_database.pkl", "rb") as f:
+            self.sample_image_database = pickle.load(f)
+        with open(self.database_path / "sample_depth_database.pkl", "rb") as f:
+            self.sample_depth_database = pickle.load(f)
+
         if idx_list is not None:
             [database.pop(key) for key in list(database.keys()) if key.split("_")[0] not in idx_list]
         self.database = list(database.values())
+        self.sample_num = sample_num
+        self.x_range = x_range
+        self.z_range = z_range
+        self.random_flip = random_flip
 
-        self.sample_group = {
-            "sample_num": 30,
-            "pointer": len(database),
-            "x_range": [[-15.], [15.]],
-            "z_range": [[25.], [65.]],
-            "indices": None
-        }
+        self.pointer = len(database)
+        self.indices = None
 
     @staticmethod
     def get_ry_(alpha, xyz_, calib_):
@@ -103,38 +116,127 @@ class SampleDatabase:
         y /= b
         return y
 
-    def sample_with_fixed_number(self, calib_, plane_):
-        database, sample_group = self.database, self.sample_group
-        sample_num, pointer, indices = int(sample_group['sample_num']), sample_group['pointer'], sample_group['indices']
-        low_x, high_x = sample_group["x_range"]
-        low_z, high_z = sample_group["z_range"]
+    @staticmethod
+    def flip_sample(sample):
+        sample = sample.copy()
+        calib = sample['calib']
+        h, w = sample['image_shape']
+        calib.flip([w, h])
+        u_min, _, u_max, _ = sample['bbox2d']
+        sample['bbox2d'][0], sample['bbox2d'][2] = w - u_max, w - u_min
+        ry = np.pi - sample['label'].ry
+        if ry > np.pi: ry -= 2 * np.pi
+        if ry < -np.pi: ry += 2 * np.pi
+        sample['label'].ry = ry
+        sample['label'].pos[0] *= -1
+        sample['label'].alpha = calib.ry2alpha(ry, w - (u_max + u_min) / 2)
+        sample['plane'][0] *= -1
+        sample['flipped'] = True
+        return sample
+
+    def samples_from_database(self, num):
+        pointer, indices, database = self.pointer, self.indices, self.database
         if pointer >= len(database):
             indices = np.random.permutation(len(database))
             pointer = 0
+        samples = [database[idx] for idx in indices[pointer: pointer + num]]
+        if len(samples) < num:
+            samples += [database[idx] for idx in indices[: num - len(samples)]]
 
-        samples = [database[idx] for idx in indices[pointer: pointer + sample_num]]
+        pointer += len(samples)
+        self.pointer = pointer
+        self.indices = indices
+        return samples
+
+    def xyz_to_bbox3d(self, samples, xyz_, calib_, random_flip=0.):
         sample_num = len(samples)
-        # 获取原始 bbox3d
-        # xyz = np.array([s['label'].pos for s in samples])
+        if sample_num == 0:
+            return [], np.zeros((0, 7))
+
+        for i, sample in enumerate(samples):
+            if np.random.rand() < random_flip:  # 随机翻转
+                samples[i] = self.flip_sample(sample)
+
         alpha = np.array([[s['label'].alpha] for s in samples])
         lhw = np.array([[s['label'].l, s['label'].h, s['label'].w] for s in samples])
-        # calib = [s['calib'] for s in samples]
-        # plane = [s['plane'] for s in samples]
 
         # 采样 bbox3d
-        x_ = np.random.uniform(low=low_x, high=high_x, size=(sample_num, 1))
-        z_ = np.random.uniform(low=low_z, high=high_z, size=(sample_num, 1))
-        y_ = np.array([self.get_y_on_plane(x_[i], z_[i], plane_) for i in range(sample_num)])
-        xyz_ = np.concatenate([x_, y_, z_], axis=1)
         ry_ = np.array([self.get_ry_(alpha[i], xyz_[i], calib_) for i in range(sample_num)])
         bbox3d_ = np.concatenate([xyz_, lhw, ry_], axis=1)
 
-        pointer += sample_num
-        sample_group['pointer'] = pointer
-        sample_group['indices'] = indices
         return samples, bbox3d_
 
-    def sample_with_fixed_idx(self, xyz_, calib_, index):
+    def sample_xyz(self, plane_=None, samples=None, xyz_=None):
+        if samples is not None and xyz_ is not None:
+            assert len(samples) == xyz_.shape[0]
+        sample_num = int(self.sample_num) if samples is None else len(samples)
+        sample_num = sample_num if xyz_ is None else xyz_.shape[0]
+        if samples is None:
+            samples = self.samples_from_database(sample_num)
+        if xyz_ is None:
+            assert plane_ is not None
+            low_z, high_z = self.z_range
+            low_x, high_x = self.x_range
+            x_ = np.random.uniform(low=low_x, high=high_x, size=(sample_num, 1))
+            z_ = np.random.uniform(low=low_z, high=high_z, size=(sample_num, 1))
+            y_ = np.array([self.get_y_on_plane(x_[i], z_[i], plane_) for i in range(sample_num)])
+            xyz_ = np.concatenate([x_, y_, z_], axis=1)
+        return samples, xyz_
+
+    @staticmethod
+    def get_scene_type(pos):
+        z = pos[:, 1]
+        segments = {
+            "a": (70 > z) & (z >= 45),  # 3049
+            "b": (45 > z) & (z >= 30),  # 1846
+            "c": (30 > z) & (z >= 15),  # 2057
+            "d": (15 > z) & (z >= 0)  # 529
+        }
+        grid_sums = {key: np.sum(value) for key, value in segments.items()}
+        scene_type = max(grid_sums, key=grid_sums.get)
+        return scene_type
+
+    def get_valid_grid(self, grid):
+        pos2d = np.array(list(grid.keys()))
+        dis = np.linalg.norm(pos2d, axis=1)
+
+        scene_type = self.get_scene_type(pos2d)
+
+        # 删除超过范围的 grid
+        valid = dis < min(np.max(dis) - 10, 65)  # 最大距离附近的点不可信，超过 65m 的点不可信
+        pos2d = pos2d[valid]
+
+        # 选取指定范围的 grid
+        state = {
+            'a': lambda x: (60 > x[:, 1]) & (x[:, 1] >= 40),
+            'b': lambda x: (50 > x[:, 1]) & (x[:, 1] >= 30),
+            'c': lambda x: (40 > x[:, 1]) & (x[:, 1] >= 20),
+            'd': lambda x: np.zeros_like(x[:, 1], dtype=bool)
+        }
+        valid = state[scene_type](pos2d)
+        pos2d = pos2d[valid]
+
+        return pos2d, scene_type
+
+    def sample_from_grid(self, grid, grid_size=1.):
+        pos2d, scene_type = self.get_valid_grid(grid)
+        grid_sum = pos2d.shape[0]
+
+        sample_num = grid_sum // 10
+        samples = self.samples_from_database(sample_num)
+
+        indices = np.random.choice(pos2d.shape[0], sample_num, replace=False)
+        offset = np.random.uniform(-grid_size / 2, grid_size / 2, size=(sample_num, 2))
+        pos2d = pos2d[indices]
+
+        plane_ = [grid[(pos2d[i][0], pos2d[i][1])]["plane"] for i in range(sample_num)]
+        x_, z_ = (pos2d + offset).T
+        y_ = np.array([self.get_y_on_plane(x_[i], z_[i], plane_[i]) for i in range(sample_num)])
+
+        xyz_ = np.vstack((x_, y_, z_)).T
+        return samples, xyz_, scene_type
+
+    def fixed_sample(self, xyz_, calib_, index):
         n = xyz_.shape[0]
         samples = [self.database[index] for i in range(n)]
         alpha = np.array([[s['label'].alpha] for s in samples])
@@ -153,7 +255,7 @@ class SampleDatabase:
         return cos >= limit
 
     @staticmethod
-    def sample_put_on_plane(bbox3d, ground, radius=2, min_num=10, max_var=0.5e-2, max_degree=20):
+    def sample_put_on_plane(bbox3d, ground, radius=3, min_num=25, max_var=0.5e-2, max_degree=20):
         bbox3d = bbox3d.copy()
         flag = np.zeros((bbox3d.shape[0]), dtype=bool)
         for i, pos in enumerate(bbox3d[:, :3]):
@@ -175,11 +277,22 @@ class SampleDatabase:
             flag[i] = True
         return bbox3d, flag
 
-    def get_samples(self, ground, non_ground, calib_, plane_):
-        samples, bbox3d = self.sample_with_fixed_number(calib_, plane_)
+    def get_samples(self, ground, non_ground, calib_, plane_, grid=None, ues_plane_filter=True):
+        if grid is None:
+            samples, xyz_ = self.sample_xyz(plane_)
+            radius = 3
+            ues_plane_filter = True
+        else:
+            samples, xyz_, scene_type = self.sample_from_grid(grid)
+            radius = {'a': 4, 'b': 3, 'c': 2, 'd': 1}[scene_type]
 
-        # 放置于地面，第一次筛除
-        bbox3d_, flag1 = self.sample_put_on_plane(bbox3d, ground)
+        samples, bbox3d_ = self.xyz_to_bbox3d(samples, xyz_, calib_, random_flip=self.random_flip)
+
+        flag1 = np.ones((bbox3d_.shape[0]), dtype=bool)
+        # 判断样本是否在地面上，第一次筛除
+        if ues_plane_filter:
+            bbox3d_, flag1 = self.sample_put_on_plane(bbox3d_, ground, radius=radius, min_num=10, max_degree=15)
+
         if flag1.sum() == 0:
             return []
 
@@ -202,18 +315,26 @@ class SampleDatabase:
             return []
 
         # 合并筛除结果
-        valid = np.arange(bbox3d.shape[0])[flag1][flag2][flag3]
+        valid = np.arange(bbox3d_.shape[0])[flag1][flag2][flag3]
         res = [Sample(samples[i], bbox3d_[i], calib_, self) for i in valid]
         return res
 
     @staticmethod
-    def add_samples_to_scene(samples, image, depth, max_num=10):
+    def add_samples_to_scene(samples, image, depth, max_num=10, use_edge_blur=False):
         image_, depth_ = image.copy(), depth.copy()
+        mask = np.zeros(image.shape[:2], dtype=bool)
+        samples = random.sample(samples, np.min([max_num, len(samples)]))
+        samples = sorted(samples, key=lambda x: x.bbox3d_[2], reverse=True)  # z 降序
         flag = np.zeros(len(samples), dtype=bool)
-        samples = sorted(samples, key=lambda x: x.bbox3d_[2], reverse=True)[:max_num]
         for i, sample in enumerate(samples):
-            image_, depth_, flag[i] = sample.cover(image_, depth_)
+            image_, depth_, mask, flag[i] = sample.cover(image_, depth_, mask)
 
+        if use_edge_blur:
+            blur = cv2.GaussianBlur(image_, (3, 3), 0)
+            kernel = np.ones((3, 3), np.uint8)
+            mask_ = cv2.erode(mask.astype(np.uint8), kernel, iterations=1)
+            blur_place = mask_.astype(bool) != mask
+            image_[blur_place] = blur[blur_place]
         return image_, depth_, [sample for i, sample in enumerate(samples) if flag[i]]
 
 
@@ -225,29 +346,44 @@ class Sample:
 
         self.label = sample['label']
         self.calib = sample['calib']
+        self.alpha_ = sample['label'].alpha
         self.calib_ = calib
         self.plane = sample['plane']
         self.bbox2d = sample['bbox2d']
         self.name = sample['name']
 
-        self.image = self.get_image()
-        self.depth = self.get_depth()
+        self.flipped = sample.get('flipped', False)
+        self.image = self.get_image(flip=self.flipped)
+        self.depth = self.get_depth(flip=self.flipped)
 
         self.occlusion_ = 0  # 需要在最终图像中求
+        self.trucation_ = 0
         self.image_, self.depth_, self.bbox2d_ = self.transform()
 
     def __repr__(self):
         return f"Sample(name={self.name})"
 
-    def get_image(self):
-        image_file = self.database.image_path / (self.name + ".png")
-        assert image_file.exists()
-        return cv2.imread(str(image_file))
+    def get_image(self, flip=False):
+        try:
+            image = self.database.sample_image_database[self.name]
+        except KeyError:
+            image_file = self.database.image_path / (self.name + ".png")
+            assert image_file.exists()
+            image = cv2.imread(str(image_file))
+        if flip:
+            image = cv2.flip(image, 1)
+        return image
 
-    def get_depth(self):
-        depth_file = self.database.depth_path / (self.name + ".png")
-        assert depth_file.exists()
-        return cv2.imread(str(depth_file), cv2.IMREAD_UNCHANGED) / 256.0
+    def get_depth(self, flip=False):
+        try:
+            depth = self.database.sample_depth_database[self.name]
+        except KeyError:
+            depth_file = self.database.depth_path / (self.name + ".png")
+            assert depth_file.exists()
+            depth = cv2.imread(str(depth_file), cv2.IMREAD_UNCHANGED) / 256.0
+        if flip:
+            depth = cv2.flip(depth, 1)
+        return depth
 
     def get_points(self):
         assert self.depth.shape[:2] == self.image.shape[:2]
@@ -272,7 +408,7 @@ class Sample:
         return cord, rgb
 
     @staticmethod
-    def get_3d_center_in_2d(xyz, calib):
+    def get_3d_center_in_2d(xyz, calib):  # kitti 的 pos 是底部中心, xyz 需要为实际中心
         xyz = xyz.reshape(1, -1)[:, :3]
         uv, _ = calib.rect_to_img(xyz)
         uv = np.round(uv).astype(int).reshape(2)
@@ -281,15 +417,18 @@ class Sample:
     def transform(self):
         assert self.depth.shape[:2] == self.image.shape[:2]
         image, depth, calib, label = self.image, self.depth, self.calib, self.label
-        calib_, bbox3d_, bbox2d = self.calib_, self.bbox3d_, self.bbox2d
+        calib_, bbox3d_, bbox2d, alpha_ = self.calib_, self.bbox3d_, self.bbox2d, self.alpha_
 
-        center = self.get_3d_center_in_2d(label.pos, self.calib)
-        center_ = self.get_3d_center_in_2d(bbox3d_[:3], calib_)
+        center = self.get_3d_center_in_2d(label.pos + [0, -label.h / 2, 0], calib)
+        center_ = self.get_3d_center_in_2d(bbox3d_[:3] + [0, -bbox3d_[4] / 2, 0], calib_)
+
         dry = bbox3d_[6] - label.ry  # ry_ - ry
         h, w = depth.shape
 
         offset = np.arange(w, dtype=int) - center[0] + bbox2d[0]
-        offset = - np.tan(dry) * offset * label.w / w
+
+        width = abs(np.sin(alpha_) * label.w) + abs(np.cos(alpha_) * label.l)
+        offset = - np.tan(dry) * offset * width / w
 
         depth_ = depth - label.pos[2] + offset.reshape(1, -1) + bbox3d_[2]
         depth_[depth < 1e-2] = 0
@@ -307,39 +446,68 @@ class Sample:
 
         return image_, depth_, bbox2d_.tolist()
 
-    def cover(self, image, depth, area_threshold=0.5):
+    @staticmethod
+    def truncate(image_, depth_, bbox2d_, image_shape):
+        h, w = image_shape[:2]
+        u_min, v_min, u_max, v_max = bbox2d_
+        area = (v_max - v_min) * (u_max - u_min)
+        if u_min < 0:
+            image_ = image_[:, -u_min:]
+            depth_ = depth_[:, -u_min:]
+            bbox2d_[0] = 0
+        if v_min < 0:
+            image_ = image_[-v_min:, :]
+            depth_ = depth_[-v_min:, :]
+            bbox2d_[1] = 0
+        if u_max > w:
+            image_ = image_[:, :w - u_max]
+            depth_ = depth_[:, :w - u_max]
+            bbox2d_[2] = w
+        if v_max > h:
+            image_ = image_[:h - v_max, :]
+            depth_ = depth_[:h - v_max, :]
+            bbox2d_[3] = h
+        area_ = (bbox2d_[3] - bbox2d_[1]) * (bbox2d_[2] - bbox2d_[0])
+        truncate_rate = (area - area_) / area
+        return image_, depth_, bbox2d_, truncate_rate
+
+    def cover(self, image, depth, mask, area_threshold=0.5):
         assert image.shape[:2] == depth.shape
-        blank_rgb, blank_d = image.copy(), depth.copy()
+        blank_rgb, blank_d, mask = image.copy(), depth.copy(), mask.copy()
         image_, depth_, bbox2d_ = self.image_, self.depth_, self.bbox2d_
+        # 截取图像外的样本
+        image_, depth_, bbox2d_, self.trucation_ = self.truncate(image_, depth_, bbox2d_, image.shape)
 
         u_min, v_min, u_max, v_max = bbox2d_
-        # 避免 bbox2d_ 在图像外
-        if u_min < 0 or v_min < 0 or u_max > image.shape[1] or v_max > image.shape[0]:
-            return blank_rgb, blank_d, False
+        if u_min >= u_max or v_min >= v_max:  # 可能发生
+            return blank_rgb, blank_d, mask, False
 
         d_in_bbox2d = blank_d[v_min: v_max, u_min: u_max]
         valid = (depth_ > 1e-2) & (depth_ < d_in_bbox2d)
         area = (v_max - v_min) * (u_max - u_min) - np.sum(depth_ <= 1e-2)
         valid_rate = np.sum(valid) / area
         if valid_rate <= area_threshold:
-            return blank_rgb, blank_d, False
+            return blank_rgb, blank_d, mask, False
 
         blank_rgb[v_min: v_max, u_min: u_max][valid] = image_[valid]
         blank_d[v_min: v_max, u_min: u_max][valid] = depth_[valid]
+        mask[v_min: v_max, u_min: u_max][valid] = True
 
-        return blank_rgb, blank_d, True
+        return blank_rgb, blank_d, mask, True
 
     def to_label(self):
         label = self.label
         cls = label.cls_type
-        trucation = 0
+        trucation = self.trucation_
         score = 0
         occlusion = 0
         x_, y_, z_, l_, h_, w_, ry_ = self.bbox3d_
         alpha = self.get_alpha(self.bbox3d_[:3], ry_, self.calib_)
         u_min, v_min, u_max, v_max = self.bbox2d_
         line = f"{cls} {trucation} {occlusion} {alpha} {u_min} {v_min} {u_max} {v_max} {h_} {w_} {l_} {x_} {y_} {z_} {ry_} {score}"
-        return Object3d(line)
+        res = Object3d(line)
+        res.is_fake = True
+        return res
 
     @staticmethod
     def get_alpha(xyz, ry, calib):
@@ -350,6 +518,8 @@ class Sample:
 
 from pathlib import Path
 import time
+import datetime
+
 if __name__ == '__main__':
     test_dir = Path("/mnt/e/DataSet/kitti/kitti_inst_database/test")
     np.random.seed(0)
@@ -364,14 +534,20 @@ if __name__ == '__main__':
         image, depth = dataset.get_image_with_depth(idx, use_penet=True)
         ground, non_ground = dataset.get_lidar_with_ground(idx, fov=True)
         plane_ = dataset.get_plane(idx)
+        grid = dataset.get_grid(idx)
+        _, _, labels = dataset.get_bbox(idx, chosen_cls=["Car", 'Van', 'Truck', 'DontCare'])
 
         time1 = time.time()
-        samples = database.get_samples(ground, non_ground, calib_, plane_)
-        image_, depth_, samples = database.add_samples_to_scene(samples, image, depth)
+        samples = database.get_samples(ground, non_ground, calib_, plane_, grid=grid)
+        image_, depth_, samples = database.add_samples_to_scene(samples, image, depth, use_edge_blur=True)
+        labels = merge_labels(labels, samples, calib_, image.shape)
         time2 = time.time()
+
+        for label in labels:
+            cv2.putText(image_, str(round(label.area, 2)), (int(label.box2d[0]), int(label.box2d[1])),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         mean_samples += len(samples)
         cv2.imwrite(str(test_dir / ('%06d.png' % idx)), image_)
         dt += time2 - time1
-
     print("time: ", dt / n)
     print(mean_samples / n)

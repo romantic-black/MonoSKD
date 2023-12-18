@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import pathlib
+import pickle
 import re
 import open3d as o3d
 import xml.etree.ElementTree as ET
@@ -188,6 +189,13 @@ class Dataset:
         bbox3d = np.array([[obj.pos[0], obj.pos[1], obj.pos[2], obj.l, obj.h, obj.w, obj.ry] for obj in obj_list])
         bbox2d = np.array([obj.box2d for obj in obj_list])
         return bbox3d, bbox2d, obj_list
+
+    def get_grid(self, idx):
+        grid_plane_file = self.dataset_path / 'grid_planes' / ('%06d.pkl' % idx)
+        assert grid_plane_file.exists()
+        grid = pickle.load(open(str(grid_plane_file), 'rb'))
+        return grid
+
     @staticmethod
     def split_dict(data):
         length = len(next(iter(data.values())))

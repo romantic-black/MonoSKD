@@ -44,7 +44,7 @@ class Object3d(object):
         elif height >= 25 and self.trucation <= 0.3 and self.occlusion <= 1:
             self.level_str = 'Moderate'
             return 2  # Moderate
-        elif height >= 25 and self.trucation <= 0.5 and self.occlusion <= 2:
+        elif height >= 20 and self.trucation <= 0.5 and self.occlusion <= 2:
             self.level_str = 'Hard'
             return 3  # Hard
         else:

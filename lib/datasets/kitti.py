@@ -121,25 +121,24 @@ class KITTI(data.Dataset):
         dataset, database = self.dataset, self.database
         image, depth = dataset.get_image_with_depth(idx, use_penet=True)
         calib = dataset.get_calib(idx)
-        ground, non_ground = dataset.get_lidar_with_ground(idx, fov=True)
-        plane = dataset.get_plane(idx)
         _, _, labels = dataset.get_bbox(idx, chosen_cls=["Car", 'Van', 'Truck', 'DontCare'])
 
         if use_aug:
-            samples = database.get_samples(ground, non_ground, calib, plane)
-            image, depth, samples = database.add_samples_to_scene(samples, image, depth)
+            ground, non_ground = dataset.get_lidar_with_ground(idx, fov=True)
+            grid = dataset.get_grid(idx)
+            plane = dataset.get_plane(idx)
+            samples = database.get_samples(ground, non_ground, calib, plane, grid)
+            image, depth, samples = database.add_samples_to_scene(samples, image, depth, use_edge_blur=True)
             labels = merge_labels(labels, samples, calib, image.shape)
 
         return Image.fromarray(image), Image.fromarray(depth), labels, calib
-
-
 
     def __getitem__(self, item):
         #  ============================   get inputs   ===========================
         index = int(self.idx_list[item])  # index mapping, get real data id
         # image loading
         random_sample_flag = False
-        if self.data_augmentation and np.random.random() < self.random_sample :
+        if self.data_augmentation and np.random.random() < self.random_sample:
             random_sample_flag = True
         img, d, objects, calib = self.get_data(index, use_aug=random_sample_flag)
         img_size = np.array(img.size)
