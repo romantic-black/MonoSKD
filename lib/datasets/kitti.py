@@ -9,18 +9,21 @@ import matplotlib.pyplot as plt
 from lib.datasets.utils import angle2class
 from lib.datasets.utils import gaussian_radius
 from lib.datasets.utils import draw_umich_gaussian
-from lib.datasets.utils import get_angle_from_box3d,check_range
+from lib.datasets.utils import get_angle_from_box3d, check_range
 from lib.datasets.kitti_utils import get_objects_from_label
 from lib.datasets.kitti_utils import Calibration
 from lib.datasets.kitti_utils import get_affine_transform
 from lib.datasets.kitti_utils import affine_transform
 from lib.datasets.kitti_utils import compute_box_3d
+from tools.dataset_util import Dataset
+from tools.sample_util import SampleDatabase, merge_labels
 import pdb
 
 import cv2 as cv
 import torchvision.ops.roi_align as roi_align
 import math
 from lib.datasets.kitti_utils import Object3d
+from tools.box_util import rect2lidar
 from lib.datasets.kitti_utils import color_aug
 
 
@@ -44,9 +47,9 @@ class KITTI(data.Dataset):
          'Cyclist': np.array([1.76282397,0.59706367,1.73698127])] 
         '''
         ##l,w,h
-        self.cls_mean_size = np.array([[1.76255119    ,0.66068622   , 0.84422524   ],
-                                       [1.52563191462 ,1.62856739989, 3.88311640418],
-                                       [1.73698127    ,0.59706367   , 1.76282397   ]])
+        self.cls_mean_size = np.array([[1.76255119, 0.66068622, 0.84422524],
+                                       [1.52563191462, 1.62856739989, 3.88311640418],
+                                       [1.73698127, 0.59706367, 1.76282397]])
 
         # data split loading
         assert split in ['train', 'val', 'trainval', 'test']
@@ -61,17 +64,22 @@ class KITTI(data.Dataset):
         self.calib_dir = os.path.join(self.data_dir, 'calib')
         self.label_dir = os.path.join(self.data_dir, 'label_2')
         self.dense_depth_dir = cfg['dense_depth_dir']
+        self.database_dir = os.path.join(root_dir, 'kitti_drx_database')
+
+        self.dataset = Dataset(split, root_dir)
+        self.database = SampleDatabase(self.database_dir, self.idx_list)
 
         # data augmentation configuration
         self.data_augmentation = True if split in ['train', 'trainval'] else False
         self.random_flip = cfg['random_flip']
         self.random_crop = cfg['random_crop']
+        self.random_sample = cfg['random_sample']
         self.scale = cfg['scale']
         self.shift = cfg['shift']
 
         # statistics
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        self.std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
         self.gt_depth_mean = np.array([8.765, 8.765, 8.765], dtype=np.float32)
         self.gt_depth_std = np.array([11.275, 11.275, 11.275], dtype=np.float32)
@@ -91,8 +99,7 @@ class KITTI(data.Dataset):
     def get_image(self, idx):
         img_file = os.path.join(self.image_dir, '%06d.png' % idx)
         assert os.path.exists(img_file)
-        return Image.open(img_file)    # (H, W, 3) RGB mode
-
+        return Image.open(img_file)  # (H, W, 3) RGB mode
 
     def get_label(self, idx):
         label_file = os.path.join(self.label_dir, '%06d.txt' % idx)
@@ -112,14 +119,39 @@ class KITTI(data.Dataset):
     def __len__(self):
         return self.idx_list.__len__()
 
+    def get_data(self, idx, use_aug=False, test=False):
+        dataset, database = self.dataset, self.database
+        calib = dataset.get_calib(idx)
+
+        if test:
+            labels = None
+            image = dataset.get_image(idx)
+            depth = np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
+        else:
+            image, depth = dataset.get_image_with_depth(idx, use_penet=False)
+            _, _, labels = dataset.get_bbox(idx, chosen_cls=["Car", 'Van', 'Truck', 'DontCare'])
+
+        if use_aug:
+            ground, non_ground = dataset.get_lidar_with_ground(idx, fov=True)
+            grid = dataset.get_grid(idx)
+            plane = dataset.get_plane(idx)
+            samples = database.get_samples(ground, non_ground, calib, plane, grid)
+            image, depth, samples = database.add_samples_to_scene(samples, image, depth, use_edge_blur=True)
+            labels = merge_labels(labels, samples, calib, image.shape)
+
+        return Image.fromarray(image), Image.fromarray(depth), labels, calib
+
     def __getitem__(self, item):
         #  ============================   get inputs   ===========================
         index = int(self.idx_list[item])  # index mapping, get real data id
-        img = self.get_image(index)
-        # depth2 = self.get_gt_depth(index)
+        # image loading
+        random_sample_flag = False
+        if self.data_augmentation and np.random.random() < self.random_sample:
+            random_sample_flag = True
+        img, d, objects, calib = self.get_data(index, use_aug=random_sample_flag, test=self.split == 'test')
         img_size = np.array(img.size)
 
-        if self.split!='test':
+        if self.split != 'test':
             d = cv.imread('{}/{:0>6}.png'.format(self.dense_depth_dir, index), -1) / 256.
             dst_W, dst_H = img_size
             pad_h, pad_w = dst_H - d.shape[0], (dst_W - d.shape[1]) // 2
@@ -138,7 +170,7 @@ class KITTI(data.Dataset):
                 random_flip_flag = True
                 img = img.transpose(Image.FLIP_LEFT_RIGHT)
                 # depth2 = depth2.transpose(Image.FLIP_LEFT_RIGHT)
-                if self.split!='test':
+                if self.split != 'test':
                     d = d.transpose(Image.FLIP_LEFT_RIGHT)
 
             if np.random.random() < self.random_crop:
@@ -154,51 +186,49 @@ class KITTI(data.Dataset):
                             method=Image.AFFINE,
                             data=tuple(trans_inv.reshape(-1).tolist()),
                             resample=Image.BILINEAR)
-        if self.split!='test':
+        if self.split != 'test':
             d_trans = d.transform(tuple(self.resolution.tolist()),
-                                method=Image.AFFINE,
-                                data=tuple(trans_inv.reshape(-1).tolist()),
-                                resample=Image.BILINEAR)
+                                  method=Image.AFFINE,
+                                  data=tuple(trans_inv.reshape(-1).tolist()),
+                                  resample=Image.BILINEAR)
             d_trans = np.array(d_trans)
-            down_d_trans = cv.resize(d_trans, (self.resolution[0]//self.downsample, self.resolution[1]//self.downsample),
-                            interpolation=cv.INTER_AREA)
+            down_d_trans = cv.resize(d_trans,
+                                     (self.resolution[0] // self.downsample, self.resolution[1] // self.downsample),
+                                     interpolation=cv.INTER_AREA)
 
-        coord_range = np.array([center-crop_size/2,center+crop_size/2]).astype(np.float32)
+        coord_range = np.array([center - crop_size / 2, center + crop_size / 2]).astype(np.float32)
         # image encoding
         img = np.array(img).astype(np.float32) / 255.0
         if self.data_augmentation:
-           color_aug(self._data_rng, img, self._eig_val, self._eig_vec)
+            color_aug(self._data_rng, img, self._eig_val, self._eig_vec)
         img = (img - self.mean) / self.std
         img = img.transpose(2, 0, 1)  # C * H * W
 
         if self.split != 'test':
-            depth_map = d_trans.astype(np.float32) / 256.0
-            depth_map = depth_map * aug_scale
+            # depth_map = d_trans.astype(np.float32) / 256.0  # 感觉重复操作了
+            depth_map = d_trans * aug_scale
             depth_map = np.expand_dims(depth_map, 2)
             depth_map = np.repeat(depth_map, 3, 2)
             depth_map = depth_map / 80.0
             # depth_map = (depth_map - self.gt_depth_mean) / self.gt_depth_std
             depth_map = depth_map.transpose(2, 0, 1)  # C * H * W
 
-        calib = self.get_calib(index)
-        features_size = self.resolution // self.downsample# W * H
+        features_size = self.resolution // self.downsample  # W * H
         #  ============================   get labels   ==============================
-        if self.split!='test':
-            objects = self.get_label(index)
-            # data augmentation for labels
+        if self.split != 'test':
             if random_flip_flag:
                 calib.flip(img_size)
                 for object in objects:
                     [x1, _, x2, _] = object.box2d
-                    object.box2d[0],  object.box2d[2] = img_size[0] - x2, img_size[0] - x1
+                    object.box2d[0], object.box2d[2] = img_size[0] - x2, img_size[0] - x1
                     object.ry = np.pi - object.ry
                     object.pos[0] *= -1
                     if object.ry > np.pi:  object.ry -= 2 * np.pi
                     if object.ry < -np.pi: object.ry += 2 * np.pi
             # labels encoding
-            heatmap = np.zeros((self.num_classes, features_size[1], features_size[0]), dtype=np.float32) # C * H * W
-            box2d_gt = np.zeros((self.max_objs, 4), dtype=np.float32) # add
-            box2d_gt_head = np.zeros((self.max_objs, 4), dtype=np.float32) # add
+            heatmap = np.zeros((self.num_classes, features_size[1], features_size[0]), dtype=np.float32)  # C * H * W
+            box2d_gt = np.zeros((self.max_objs, 4), dtype=np.float32)  # add
+            box2d_gt_head = np.zeros((self.max_objs, 4), dtype=np.float32)  # add
 
             size_2d = np.zeros((self.max_objs, 2), dtype=np.float32)
             offset_2d = np.zeros((self.max_objs, 2), dtype=np.float32)
@@ -213,15 +243,15 @@ class KITTI(data.Dataset):
             indices = np.zeros((self.max_objs), dtype=np.int64)
             # if torch.__version__ == '1.10.0+cu113':
             if torch.__version__ in ['1.10.0+cu113', '1.10.0', '1.6.0', '1.4.0']:
-                mask_2d = np.zeros((self.max_objs), dtype=np.bool)
+                mask_2d = np.zeros((self.max_objs), dtype=bool)
             else:
                 mask_2d = np.zeros((self.max_objs), dtype=np.uint8)
             object_num = len(objects) if len(objects) < self.max_objs else self.max_objs
 
             vis_depth = np.zeros((self.max_objs, 7, 7), dtype=np.float32)
             att_depth = np.zeros((self.max_objs, 7, 7), dtype=np.float32)
-            depth_mask = np.zeros((self.max_objs, 7, 7), dtype=np.bool)
-            
+            depth_mask = np.zeros((self.max_objs, 7, 7), dtype=bool)
+
             mask_3d = np.zeros((self.max_objs), dtype=np.uint8)
             for i in range(object_num):
                 # filter objects by writelist
@@ -245,9 +275,9 @@ class KITTI(data.Dataset):
                 # modify the 2d bbox according to pre-compute downsample ratio
                 bbox_2d[:] /= self.downsample
 
-
                 # process 3d bbox & get 3d center
-                center_2d = np.array([(bbox_2d[0] + bbox_2d[2]) / 2, (bbox_2d[1] + bbox_2d[3]) / 2], dtype=np.float32)  # W * H
+                center_2d = np.array([(bbox_2d[0] + bbox_2d[2]) / 2, (bbox_2d[1] + bbox_2d[3]) / 2],
+                                     dtype=np.float32)  # W * H
                 center_3d = objects[i].pos + [0, -objects[i].h / 2, 0]  # real 3D center in 3D space
                 center_3d = center_3d.reshape(-1, 3)  # shape adjustment (N, 3)
                 center_3d, _ = calib.rect_to_img(center_3d)  # project 3D center to image plane
@@ -282,8 +312,8 @@ class KITTI(data.Dataset):
                 depth[i] = objects[i].pos[-1]
 
                 # encoding heading angle
-                #heading_angle = objects[i].alpha
-                heading_angle = calib.ry2alpha(objects[i].ry, (objects[i].box2d[0]+objects[i].box2d[2])/2)
+                # heading_angle = objects[i].alpha
+                heading_angle = calib.ry2alpha(objects[i].ry, (objects[i].box2d[0] + objects[i].box2d[2]) / 2)
                 if heading_angle > np.pi:  heading_angle -= 2 * np.pi  # check range
                 if heading_angle < -np.pi: heading_angle += 2 * np.pi
                 heading_bin[i], heading_res[i] = angle2class(heading_angle)
@@ -293,8 +323,8 @@ class KITTI(data.Dataset):
                 mean_size = self.cls_mean_size[self.cls2id[objects[i].cls_type]]
                 size_3d[i] = src_size_3d[i] - mean_size
 
-                #objects[i].trucation <=0.5 and objects[i].occlusion<=2 and (objects[i].box2d[3]-objects[i].box2d[1])>=25:
-                if objects[i].trucation <=0.5 and objects[i].occlusion<=2:
+                # objects[i].trucation <=0.5 and objects[i].occlusion<=2 and (objects[i].box2d[3]-objects[i].box2d[1])>=25:
+                if objects[i].trucation <= 0.5 and objects[i].occlusion <= 2:
                     mask_2d[i] = 1
 
                 roi_depth = roi_align(torch.from_numpy(down_d_trans).unsqueeze(0).unsqueeze(0).type(torch.float32),
@@ -309,7 +339,6 @@ class KITTI(data.Dataset):
                 depth_mask[i] = roi_depth_ind
 
                 mask_3d[i] = 1
-
 
             targets = {'depth': depth,
                        'size_2d': size_2d,
@@ -327,29 +356,30 @@ class KITTI(data.Dataset):
                        'att_depth': att_depth,
                        'depth_mask': depth_mask,
 
-                        'mask_3d': mask_3d,
-                        'obj_num': object_num,
-                        'box2d_gt': box2d_gt,
-                        'box2d_gt_head': box2d_gt_head
+                       'mask_3d': mask_3d,
+                       'obj_num': object_num,
+                       'box2d_gt': box2d_gt,
+                       'box2d_gt_head': box2d_gt_head
                        }
         else:
             targets = {}
 
         inputs = {}
         inputs['rgb'] = img
-        if self.split!='test':
+        if self.split != 'test':
             inputs['depth'] = depth_map
         info = {'img_id': index,
                 'img_size': img_size,
-                'bbox_downsample_ratio': img_size/features_size}
+                'bbox_downsample_ratio': img_size / features_size}
 
-        return inputs, calib.P2, coord_range, targets, info   #calib.P2
+        return inputs, calib.P2, coord_range, targets, info  # calib.P2
 
 
 if __name__ == '__main__':
     from torch.utils.data import DataLoader
-    cfg = {'random_flip':0.0, 'random_crop':1.0, 'scale':0.4, 'shift':0.1, 'use_dontcare': False,
-           'class_merging': False, 'writelist':['Pedestrian', 'Car', 'Cyclist'], 'use_3d_center':False}
+
+    cfg = {'random_flip': 0.0, 'random_crop': 1.0, 'scale': 0.4, 'shift': 0.1, 'use_dontcare': False,
+           'class_merging': False, 'writelist': ['Pedestrian', 'Car', 'Cyclist'], 'use_3d_center': False}
     dataset = KITTI('../../data', 'train', cfg)
     dataloader = DataLoader(dataset=dataset, batch_size=1)
     print(dataset.writelist)
@@ -368,7 +398,6 @@ if __name__ == '__main__':
         heatmap.show()
 
         break
-
 
     # print ground truth fisrt
     objects = dataset.get_label(0)
